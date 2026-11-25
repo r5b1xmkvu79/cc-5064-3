@@ -1,0 +1,13 @@
+{
+  "name": "depth-precision-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "stub": "node test/renderer-stub.js",
+    "sweep": "node tools/sweep.js",
+    "workflow": "node tools/workflow.js",
+    "serve": "node tools/serve.js"
+  }
+}
