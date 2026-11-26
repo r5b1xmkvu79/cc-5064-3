@@ -65,6 +65,15 @@
   .pill.bad { border-color: var(--bad); color: var(--bad); }
   .pill.good { border-color: var(--good); color: var(--good); }
   .pill.warn { border-color: var(--warn); color: var(--warn); }
+  .ui-error { margin: 10px 16px 0; padding: 8px 10px; border: 1px solid var(--bad); color: #ffd7d7; background: rgba(255,93,93,.12); border-radius: 8px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .regression { margin: 8px 0 10px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); }
+  .regression .controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .regression select { min-width: 220px; }
+  #regressionReport { margin-top: 8px; display: grid; gap: 6px; }
+  .verdict { border-left: 3px solid var(--line); padding: 6px 8px; background: var(--bg); border-radius: 4px; }
+  .verdict.good { border-left-color: var(--good); }
+  .verdict.bad { border-left-color: var(--bad); }
+  .verdict.warn { border-left-color: var(--warn); }
   .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .mono { font-family: ui-monospace, Menlo, monospace; }
 </style>
@@ -75,6 +84,7 @@
   <span class="sub">同组近/远薄板 · 常规 vs 反向深度 · 真实缓冲读回 · 区块局部刷新与历史样本换算</span>
   <span id="caps" class="pill">检测能力中…</span>
 </header>
+<div id="uiError" class="ui-error" hidden></div>
 
 <div class="layout">
   <div>
@@ -90,7 +100,20 @@
     </div>
 
     <div class="panel">
-      <h2>光栅调试视窗 · 拾取与区块状态（点击任一视窗在远景薄板上点选两层）</h2>
+      <h2>光栅调试视窗 · 深度精度回归样例与拾取（点击视窗拾取薄板）</h2>
+      <div class="regression">
+        <div class="controls">
+          <select id="regressionCase" aria-label="深度精度回归样例">
+            <option value="extreme">极远薄层：反向 FLOAT32 vs UNORM24 同码平局</option>
+            <option value="sameCode">同码薄片：高精度参照分前后，目标格式接受区间平局</option>
+            <option value="nearGraze">近面擦边正例：near 外侧可见且距离可还原</option>
+            <option value="clipped">近面擦边反例：整块进入 near 内侧应被裁剪</option>
+          </select>
+          <button id="openRegression">打开回归样例并执行实际读回</button>
+          <button id="runActualAcceptance">用当前 near/far 重新验收中心像素</button>
+        </div>
+        <div id="regressionReport" class="hint">图形入口会读取真实对象 ID、深度附件状态和 R32F gl_FragCoord.z；命令行 acceptance 仅作辅助。</div>
+      </div>
       <div class="twocol">
         <div>
           <div class="kv" id="pickInfo">
@@ -166,13 +189,13 @@
     <div class="panel">
       <h2>薄板（物理固定厚度，移动远近面观察遮挡）</h2>
       <label><span class="row"><span>远景薄板距离</span><span class="mono" id="farDistVal"></span></span>
-        <input type="range" id="farDist" min="1" max="2.7" step="0.02" value="1.778" />
+        <input type="range" id="farDist" min="-1" max="5" step="0.01" value="1.778" />
       </label>
       <label><span class="row"><span>远景两层间距 gap</span><span class="mono" id="farGapVal"></span></span>
         <input type="range" id="farGap" min="-3" max="1.5" step="0.05" value="-0.301" />
       </label>
       <label><span class="row"><span>近景薄板距离</span><span class="mono" id="nearDistVal"></span></span>
-        <input type="range" id="nearDist" min="0.3" max="1.6" step="0.02" value="1.2" />
+        <input type="range" id="nearDist" min="-1" max="2" step="0.01" value="1.079" />
       </label>
       <label>区块保存内容
         <div class="seg" id="storeMode">

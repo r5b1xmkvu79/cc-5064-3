@@ -411,6 +411,18 @@ export class DepthRenderer {
     };
   }
 
+  depthState() {
+    const gl = this.gl;
+    const func = gl.getParameter(gl.DEPTH_FUNC);
+    return {
+      clearValue: gl.getParameter(gl.DEPTH_CLEAR_VALUE),
+      depthFunc:
+        func === gl.GEQUAL ? 'GEQUAL' : func === gl.LEQUAL ? 'LEQUAL' : `GLenum(${func})`,
+      depthTest: gl.isEnabled(gl.DEPTH_TEST),
+      directDepthRead: false,
+    };
+  }
+
   // Aggregate block readback for the block store / error statistics.
   readBlock(format, x, topY, w, h) {
     const gl = this.gl;

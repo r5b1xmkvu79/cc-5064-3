@@ -19,6 +19,7 @@ import {
   sweep,
   recommend,
 } from './depth-kernel.js';
+import { evaluateDepthRelation, referenceDepth } from './depth-acceptance.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -29,6 +30,7 @@ const state = {
   cameraDist: 80,
   farDistance: 60,
   farGap: 0.5,
+  farHalfExtent: 3,
   nearDistance: 12,
   nearGap: 0.2,
   farY: 0,
@@ -43,6 +45,7 @@ const fovy = Math.PI / 4;
 const camera = new OrbitCamera([0, 0, 0]);
 const refs = { A: { renderer: null, store: null }, B: { renderer: null, store: null } };
 let scene;
+let activeRegressionCase = null;
 const logEl = $('log');
 
 function log(msg, cls = '') {
@@ -52,6 +55,21 @@ function log(msg, cls = '') {
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
+
+function showUiError(error) {
+  const el = $('uiError');
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = `深度精度界面异常：${error?.stack || error?.message || String(error)}`;
+  try {
+    log(error?.message || String(error), 'e');
+  } catch {
+    // The error panel is the primary failure surface if logging is unavailable.
+  }
+}
+
+window.addEventListener('error', (event) => showUiError(event.error || event.message));
+window.addEventListener('unhandledrejection', (event) => showUiError(event.reason));
 
 function effectiveFar() {
   return state.infiniteFar ? Infinity : state.far;
@@ -211,6 +229,292 @@ function updateOcclusionVerdict() {
   $('rec').innerHTML = lines.join(' ');
 }
 
+// ------------------------------------------------- graphical acceptance
+const FAR_PLATE_THICKNESS = 0.02;
+
+const REGRESSION_PRESETS = {
+  extreme: {
+    label: '极远薄层',
+    apply(floatSupported) {
+      Object.assign(state, {
+        near: 0.1,
+        far: 100000,
+        infiniteFar: true,
+        cameraDist: 0.5,
+        farDistance: 10000,
+        farGap: 2,
+        farHalfExtent: 300,
+        farY: 0,
+        displayMode: 0,
+      });
+      state.pathA = { format: FORMATS.UNORM24, mode: MODES.CONVENTIONAL };
+      state.pathB = {
+        format: floatSupported ? FORMATS.FLOAT32 : FORMATS.UNORM24,
+        mode: MODES.REVERSED,
+      };
+    },
+  },
+  sameCode: {
+    label: '同码薄片',
+    apply(floatSupported) {
+      Object.assign(state, {
+        near: 0.1,
+        far: 1000,
+        infiniteFar: false,
+        cameraDist: 0.5,
+        farDistance: 60,
+        farGap: 0.001,
+        farHalfExtent: 3,
+        farY: 0,
+        displayMode: 0,
+      });
+      state.pathA = { format: FORMATS.UNORM24, mode: MODES.CONVENTIONAL };
+      state.pathB = {
+        format: floatSupported ? FORMATS.FLOAT32 : FORMATS.UNORM24,
+        mode: MODES.REVERSED,
+      };
+    },
+  },
+  nearGraze: {
+    label: '近面擦边正例',
+    apply(floatSupported) {
+      Object.assign(state, {
+        near: 1,
+        far: 1000,
+        infiniteFar: false,
+        cameraDist: 0.5,
+        farDistance: 0.53,
+        farGap: 0.002,
+        farHalfExtent: 3,
+        farY: 0,
+        displayMode: 0,
+      });
+      state.pathA = { format: FORMATS.UNORM24, mode: MODES.CONVENTIONAL };
+      state.pathB = {
+        format: floatSupported ? FORMATS.FLOAT32 : FORMATS.UNORM24,
+        mode: MODES.REVERSED,
+      };
+    },
+  },
+  clipped: {
+    label: '近面擦边反例',
+    apply(floatSupported) {
+      Object.assign(state, {
+        near: 1,
+        far: 1000,
+        infiniteFar: false,
+        cameraDist: 0.5,
+        farDistance: 0.45,
+        farGap: 0.002,
+        farHalfExtent: 3,
+        farY: 0,
+        displayMode: 0,
+      });
+      state.pathA = { format: FORMATS.UNORM24, mode: MODES.CONVENTIONAL };
+      state.pathB = {
+        format: floatSupported ? FORMATS.FLOAT32 : FORMATS.UNORM24,
+        mode: MODES.REVERSED,
+      };
+    },
+  },
+};
+
+function setLogControl(id, valueId, value, digits = 3) {
+  $(id).value = String(Math.log10(value));
+  if (valueId) $(valueId).textContent = value.toPrecision(digits);
+}
+
+function syncControlValues() {
+  setLogControl('near', 'nearVal', state.near, 3);
+  setLogControl('far', 'farVal', state.far, 3);
+  setLogControl('cam', 'camVal', state.cameraDist, 4);
+  setLogControl('farDist', 'farDistVal', state.farDistance, 4);
+  setLogControl('farGap', 'farGapVal', state.farGap, 3);
+  setLogControl('nearDist', 'nearDistVal', state.nearDistance, 4);
+  $('infiniteFar').checked = state.infiniteFar;
+  $('fmtA').value = state.pathA.format;
+  $('fmtB').value = state.pathB.format;
+  for (const key of ['A', 'B']) {
+    $(`mode${key}`).querySelectorAll('button').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.mode === state[`path${key}`].mode);
+    });
+  }
+  $('displayMode').querySelectorAll('button').forEach((btn) => {
+    btn.classList.toggle('active', Number(btn.dataset.m) === state.displayMode);
+  });
+  camera.distance = state.cameraDist;
+  camera.yaw = 0;
+  camera.pitch = 0;
+  setBadges();
+}
+
+// Independent ray/plane derivation. Presets use the x/y-centered far plates;
+// this intentionally does not read sample.exactViewDist to choose the expected
+// distance.
+function independentFarPlates() {
+  const eye = camera.eye();
+  const target = camera.target;
+  const length = Math.hypot(target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]);
+  const forward = [
+    (target[0] - eye[0]) / length,
+    (target[1] - eye[1]) / length,
+    (target[2] - eye[2]) / length,
+  ];
+  if (!(Math.abs(forward[2]) > 1e-8)) throw new Error('相机方向与薄板平面平行，无法独立推导纵深');
+  return [PLATE_IDS.FAR_A, PLATE_IDS.FAR_B].map((id, index) => {
+    const centerDistance = state.farDistance + index * state.farGap;
+    const faceZ = -centerDistance + FAR_PLATE_THICKNESS;
+    const travel = (faceZ - eye[2]) / forward[2];
+    const hit = [
+      eye[0] + forward[0] * travel,
+      eye[1] + forward[1] * travel,
+      eye[2] + forward[2] * travel,
+    ];
+    const half = state.farHalfExtent ?? 3;
+    return {
+      id,
+      numericId: id,
+      distance: travel,
+      hit,
+      insideCoverage: Math.abs(hit[0]) <= half && Math.abs(hit[1]) <= half,
+    };
+  });
+}
+
+function formatRegressionNumber(value, digits = 6) {
+  if (value == null) return '—';
+  if (value === Infinity) return 'Infinity';
+  if (!Number.isFinite(value)) return String(value);
+  if (value === 0) return '0';
+  return Math.abs(value) >= 1000 || Math.abs(value) < 0.001
+    ? value.toExponential(3)
+    : value.toPrecision(digits);
+}
+
+function renderRegressionReport(caseId, reports) {
+  const preset = REGRESSION_PRESETS[caseId];
+  const allOk = reports.every((r) => r.verdict.ok);
+  const header = `<div class="pill ${allOk ? 'good' : 'bad'}">${preset?.label ?? caseId}：${allOk ? '实际管线验收通过' : '发现坏结果'}</div>`;
+  const rows = reports
+    .map(({ key, path, verdict, sample, depthState, mrtReferenceError }) => {
+      const cls = verdict.ok ? 'good' : 'bad';
+      const failures = verdict.failures.length
+        ? `<div class="fail">${verdict.failures.map((f) => f.code).join(' · ')}</div>`
+        : '';
+      const interval = verdict.acceptedDistanceIntervalM
+        ? `[${formatRegressionNumber(verdict.acceptedDistanceIntervalM[0])}, ${formatRegressionNumber(verdict.acceptedDistanceIntervalM[1])}] m`
+        : '—';
+      const targetCode = referenceDepth.code(sample.hardwareDepth, path.format);
+      return `<div class="verdict ${cls}">
+        <strong>路径 ${key}</strong> · ${path.format} · ${path.mode} · ${verdict.verdict}<br>
+        <span class="mono">可见表面 ID=${sample.objectId} (${ID_LABELS[sample.objectId] ?? '背景/未知'}) · 期望前片=${verdict.expectedFrontId ?? 0}</span><br>
+        <span class="mono">clear=${depthState.clearValue ?? '?'} · depthFunc=${depthState.depthFunc ?? '?'} · DEPTH_TEST=${depthState.depthTest ?? '?'}</span><br>
+        <span class="mono">实际 z=${formatRegressionNumber(sample.hardwareDepth, 8)} · 目标码=${targetCode}</span><br>
+        <span class="mono">还原距离=${formatRegressionNumber(sample.reconstructedDistance)} m · 独立参照=${formatRegressionNumber(verdict.pickedReferenceDistanceM)} m</span><br>
+        <span class="mono">距离误差=${formatRegressionNumber(verdict.distanceErrorM)} m · 容差=${formatRegressionNumber(verdict.distanceToleranceM)} m · 接受区间=${interval}</span><br>
+        <span class="mono">MRT 精确视距互校误差=${formatRegressionNumber(mrtReferenceError)} m</span>
+        ${failures}
+      </div>`;
+    })
+    .join('');
+  $('regressionReport').innerHTML = header + rows;
+}
+
+function runActualDepthAcceptance(caseId = activeRegressionCase) {
+  if (!caseId || !refs.A.renderer || !refs.B.renderer) return null;
+  const plates = independentFarPlates();
+  const reports = [];
+  for (const key of ['A', 'B']) {
+    const renderer = refs[key].renderer;
+    const path = state[`path${key}`];
+    const params = currentParams(path.mode);
+    renderPath(key);
+    const x = Math.floor(renderer.width / 2);
+    const y = Math.floor(renderer.height / 2);
+    const sample = renderer.readPixel(path.format, x, y);
+    if (!sample) throw new Error(`${key}: ${path.format} FBO 不完整或深度读回失败`);
+    sample.reconstructedDistance = reconstructDistance(sample.hardwareDepth, params);
+    let depthState = {};
+    try {
+      depthState = renderer.depthState();
+    } catch (err) {
+      depthState = { depthStateError: err.message };
+    }
+    const spec = {
+      name: `${caseId}-${key}`,
+      params,
+      format: path.format,
+      plates,
+      // Geometry positions and projection uniforms are Float32 on the GPU.
+      // This prescribed bound is still far below the multi-metre controlled
+      // precision failures.
+      extraDistanceToleranceM: Math.max(
+        ...plates.map((p) => {
+          const e = Math.floor(Math.log2(Math.max(1, p.distance)));
+          return 8 * 2 ** (e - 23);
+        }),
+      ),
+      codeTolerance: 4,
+    };
+    const verdict = evaluateDepthRelation({ ...sample, ...depthState }, spec);
+    const independentPlate = plates.find((p) => p.numericId === Number(sample.objectId));
+    const independentDistance = independentPlate?.distance ?? verdict.pickedReferenceDistanceM;
+    const mrtReferenceError =
+      sample.exactViewDist > 0 && independentDistance != null
+        ? Math.abs(sample.exactViewDist - independentDistance)
+        : null;
+    reports.push({ key, path, verdict, sample, depthState, mrtReferenceError });
+  }
+  renderRegressionReport(caseId, reports);
+  const allOk = reports.every((r) => r.verdict.ok);
+  if (!allOk) {
+    const codes = reports.flatMap((r) => r.verdict.failures.map((f) => `${r.key}:${f.code}`));
+    showUiError(new Error(`深度管线验收未通过：${codes.join(', ')}`));
+  } else {
+    $('uiError').hidden = true;
+  }
+  return reports;
+}
+
+function refreshRegressionIfActive() {
+  if (!activeRegressionCase) return;
+  try {
+    runActualDepthAcceptance(activeRegressionCase);
+  } catch (err) {
+    showUiError(err);
+  }
+}
+
+function openDepthRegression() {
+  const caseId = $('regressionCase').value;
+  const preset = REGRESSION_PRESETS[caseId];
+  if (!preset) throw new Error(`未知深度回归样例：${caseId}`);
+  activeRegressionCase = caseId;
+  const floatSupported = refs.A.renderer?.availableFormats().includes(FORMATS.FLOAT32) ?? false;
+  preset.apply(floatSupported);
+  syncControlValues();
+  rebuildScene();
+  fullRender();
+  try {
+    runActualDepthAcceptance(caseId);
+    log(`已从光栅调试视窗打开深度精度回归样例：${preset.label}`, 'g');
+  } catch (err) {
+    showUiError(err);
+  }
+}
+
+function bindRegression() {
+  $('openRegression').addEventListener('click', openDepthRegression);
+  $('runActualAcceptance').addEventListener('click', () => {
+    activeRegressionCase = $('regressionCase').value;
+    try {
+      runActualDepthAcceptance(activeRegressionCase);
+    } catch (err) {
+      showUiError(err);
+    }
+  });
+}
+
 // -------------------------------------------------------- clip changes
 
 function onClipChanged() {
@@ -221,6 +525,7 @@ function onClipChanged() {
     sumA.undecided + sumB.undecided + sumA.tie + sumB.tie > 0 ? 'w' : 'g',
   );
   fullRender();
+  refreshRegressionIfActive();
 }
 
 // ------------------------------------------------------------- sweeps
@@ -278,38 +583,33 @@ function updateRecommend() {
 
 function bindSliders() {
   const logSliders = [
-    ['near', 'nearVal', 'near'],
-    ['far', 'farVal', 'far'],
-    ['farGap', 'farGapVal', 'farGap'],
+    ['near', 'nearVal', 'near', 3],
+    ['far', 'farVal', 'far', 3],
+    ['farGap', 'farGapVal', 'farGap', 3],
+    ['cam', 'camVal', 'cameraDist', 4],
+    ['farDist', 'farDistVal', 'farDistance', 4],
+    ['nearDist', 'nearDistVal', 'nearDistance', 4],
   ];
-  for (const [id, valId, key] of logSliders) {
+  for (const [id, valId, key, digits] of logSliders) {
     const el = $(id);
     const apply = () => {
       state[key] = 10 ** Number(el.value);
-      $(valId).textContent = state[key].toPrecision(3);
+      $(valId).textContent = state[key].toPrecision(digits);
     };
     el.addEventListener('input', () => {
       apply();
       if (key === 'near' || key === 'far') onClipChanged();
-      else fullRender();
-    });
-    apply();
-  }
-  const linear = [
-    ['cam', 'camVal', 'cameraDist', true],
-    ['farDist', 'farDistVal', 'farDistance', false],
-    ['nearDist', 'nearDistVal', 'nearDistance', false],
-  ];
-  for (const [id, valId, key, logScale] of linear) {
-    const el = $(id);
-    const apply = () => {
-      state[key] = logScale ? 10 ** Number(el.value) : Number(el.value);
-      $(valId).textContent = state[key].toPrecision(4);
-    };
-    el.addEventListener('input', () => {
-      apply();
-      if (id === 'farDist' || id === 'nearDist') rebuildScene();
-      fullRender();
+      else if (key === 'cam') {
+        camera.distance = state.cameraDist;
+        fullRender();
+        refreshRegressionIfActive();
+      } else if (key === 'farDist' || key === 'nearDist') {
+        rebuildScene();
+        fullRender();
+        refreshRegressionIfActive();
+      } else {
+        fullRender();
+      }
     });
     apply();
   }
@@ -502,11 +802,12 @@ function boot() {
     sizeCharts();
     fullRender();
   });
-  rebuildScene();
   bindSliders();
+  rebuildScene();
   bindSegments();
   bindFormatSelects();
   bindButtons();
+  bindRegression();
   bindCanvasInteraction('A', $('canvasA'));
   bindCanvasInteraction('B', $('canvasB'));
   setBadges();
@@ -516,4 +817,18 @@ function boot() {
   log('调整 near/far 触发历史样本换算；切到“仅量化码”观察同码格未决；误差图查看重建误差', 'g');
 }
 
-boot();
+if (typeof window !== 'undefined') {
+  window.depthLabRegression = {
+    presets: Object.keys(REGRESSION_PRESETS),
+    open: openDepthRegression,
+    run: runActualDepthAcceptance,
+  };
+}
+
+try {
+  boot();
+} catch (err) {
+  const caps = document.getElementById('caps');
+  if (caps) caps.innerHTML = `<span class="pill bad">${err.message}</span>`;
+  showUiError(err);
+}

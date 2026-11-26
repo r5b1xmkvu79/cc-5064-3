@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.js",
+    "verify": "npm test && npm run stub && npm run acceptance",
     "stub": "node test/renderer-stub.js",
+    "acceptance": "node tools/acceptance.js",
     "sweep": "node tools/sweep.js",
     "workflow": "node tools/workflow.js",
     "serve": "node tools/serve.js"

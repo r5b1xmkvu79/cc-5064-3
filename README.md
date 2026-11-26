@@ -18,11 +18,30 @@ npm run serve          # 零依赖静态服务器
 无头环境下用内核与扫描验证，不依赖浏览器：
 
 ```bash
-npm test               # 20 个 node:test 用例（投影、量化、重建、区块、扫描）
+npm test               # 29 个 node:test 用例（内核、投影、区块、纵深关系验收）
+npm run acceptance     # 独立参照的深度管线验收 + 映射/比较/精度变异检测
+npm run verify         # 依次运行 test、WebGL2 stub、acceptance
 npm run stub           # WebGL2 桩：FBO/MRT/uniform/读回接线检查（无 GPU，不验证真实光栅化）
 npm run sweep          # 相机范围 × 格式 × 约定 × 远平面 的失效距离扫描
 npm run workflow       # 拾取→推近局部刷新→裁面跳变 的端到端内核模拟
 ```
+
+### 图形入口：深度精度回归样例
+
+启动 `npm run serve` 后，在页面左上方 **“光栅调试视窗”** 面板中使用
+**“深度精度回归样例”** 下拉框：
+
+1. 选择“极远薄层”“同码薄片”“近面擦边正例”或“近面擦边反例”；
+2. 点 **“打开回归样例并执行实际读回”**，页面会移动 near/far、相机和薄板；
+3. 报告读取真实 WebGL2 对象 ID、`DEPTH_CLEAR_VALUE`、`DEPTH_FUNC`、
+   R32F `gl_FragCoord.z`，并用实际内核公式还原距离；
+4. 之后可手动拖动 near/far 滑杆，或点 **“用当前 near/far 重新验收中心像素”**，
+   对照可见表面 ID、深度值、还原距离和独立射线/平面参照；
+5. 运行时异常或验收坏结果会显示在页面顶部红色 `#uiError` 面板，而不是只进控制台。
+
+命令行 `npm run acceptance` 只是无 GPU 辅助：它用独立解析参照和可回放的深度附件
+语义检查清除值、量化码、LEQUAL/GEQUAL、对象拾取及受控变异。真实像素仍必须从上述
+图形入口在浏览器/GPU 中确认。
 
 真实光栅化、遮挡与误差图必须在浏览器中确认；本环境无 GPU，已通过 WebGL2 桩拦截
 着色器/uniform/附件接线错误，但像素级结果需 `npm run serve` 后人工或浏览器自动化核对。
@@ -68,9 +87,11 @@ src/geometry.js      近/远薄板对（固定物理厚度）、地面网格、�
 src/renderer.js      WebGL2：双 FBO、MRT(color + 硬件深度R32F + 精确视距R32F)、
                      LEQUAL/GEQUAL 与清除值、scissor 局部刷新、readPixels 读回、误差图后处理
 src/block-store.js   区块存储（距离/仅码两种模式）与裁面变更后的换算状态机
+src/depth-acceptance.js 独立参照、同码/分界样例、深度附件回放与变异验收
 src/charts.js        精度分布曲线(Δd-d 对数图)与区块状态图
 src/app.js           控件、拾取、遮挡次序校验、扫描表、事件日志
-test/                node:test：内核、投影矩阵与 GLSL 重建公式一致性、区块状态机
+test/                node:test：内核、投影矩阵与 GLSL 重建一致性、区块状态机、纵深关系验收
+tools/acceptance.js  独立深度管线验收与受控变异证据（辅助，不替代 GPU）
 tools/sweep.js       命令行扫描；tools/serve.js 静态服务器
 ```
 
@@ -82,3 +103,10 @@ tools/sweep.js       命令行扫描；tools/serve.js 静态服务器
   进入未决，码格不相交时给出确定性获胜者。
 - FLOAT32 反无限远能分辨 UNORM24 已塌缩的远端间距。
 - 读回的硬件深度与内核量化期望逐像素比对；遮挡次序用已知板号（A 物理上更近）核对。
+- `test/depth-relations.test.js` 与 `src/depth-acceptance.js` 用独立公式推导期望：
+  同码薄片只接受规定码格区间内的平局，不把不可分辨报成顺序错；极远物和近面擦边
+  正反例断言遮挡 ID 与距离误差。
+- 验收会主动注入映射方向颠倒、比较函数换错、16 级粗量化、重建偏差和清除值换端；
+  每个受控坏结果都必须由可见对象 ID、深度码或距离误差捕获，不允许“永远通过”的伪验收。
+- 裁面推过量化分界后，Node 回放分别验证映射错误与比较函数错误；比较方向错误的证据
+  包含实际可见像素（可能整屏背景）和还原距离，而不是只比较两个缓冲数值的排序。

@@ -49,10 +49,11 @@ function pushBox(out, cx, cy, cz, hx, hy, hz, id) {
 export function buildScene(state) {
   const out = { positions: [], ids: [], indices: [] };
   const t = 0.02; // plate half-thickness (physical geometry, fixed)
+  const farHalf = state.farHalfExtent ?? 3;
 
   // Far pair: cartographer picks these first while the camera is distant.
-  pushBox(out, 0, state.farY, -state.farDistance, 3, 3, t, PLATE_IDS.FAR_A);
-  pushBox(out, 0, state.farY, -(state.farDistance + state.farGap), 3, 3, t, PLATE_IDS.FAR_B);
+  pushBox(out, 0, state.farY, -state.farDistance, farHalf, farHalf, t, PLATE_IDS.FAR_A);
+  pushBox(out, 0, state.farY, -(state.farDistance + state.farGap), farHalf, farHalf, t, PLATE_IDS.FAR_B);
 
   // Near pair: becomes relevant after dollying in.
   pushBox(out, 4, state.nearY, -state.nearDistance, 2, 2, t, PLATE_IDS.NEAR_A);
